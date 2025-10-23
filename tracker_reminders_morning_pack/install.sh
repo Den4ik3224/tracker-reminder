@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== Tracker → Reminders installer (MSK 20:00, .env, auto yc install) =="
+echo "== Tracker → Reminders installer (DAILY 09:00 MSK, .env, auto yc install) =="
 USER_HOME="${HOME}"
 ENV_PATH="${USER_HOME}/.tracker_reminders.env"
+CLOUD_ORG_ID="bpft1b2sgogor548lq3k"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Python3 not found. Please install Python 3."
@@ -30,7 +31,6 @@ if ! command -v yc >/dev/null 2>&1; then
   fi
 fi
 
-read -r -p "Enter CLOUD_ORG_ID (Cloud Organization ID): " CLOUD_ORG_ID
 read -r -p "Enter YT_BOARD_ID (numeric board id, e.g. 582): " YT_BOARD_ID
 read -r -p "Extra filter (YT_QUERY_XTRA), default 'Status: !Closed': " YT_QUERY_XTRA
 YT_QUERY_XTRA="${YT_QUERY_XTRA:-Status: !Closed}"
@@ -74,9 +74,9 @@ cat > "${PLIST}" <<PL
     <string>/usr/bin/python3</string>
     <string>${SCRIPT_PATH}</string>
   </array>
+  <!-- каждый час, каждый день; скрипт сам пропускает всё, кроме 09:00 MSK -->
   <key>StartCalendarInterval</key>
   <dict>
-    <key>Weekday</key><integer>3</integer>
     <key>Minute</key><integer>0</integer>
   </dict>
   <key>StandardOutPath</key><string>/tmp/tracker2reminders.out</string>
@@ -90,6 +90,6 @@ launchctl unload "${PLIST}" >/dev/null 2>&1 || true
 launchctl load  "${PLIST}"
 
 echo "LaunchAgent installed: com.tracker.reminders.sync"
-echo "Running initial sync (guard may skip if not Tue 20:00 MSK)..."
+echo "Running initial sync (guard may skip if not 09:00 MSK)..."
 /usr/bin/python3 "${SCRIPT_PATH}" || true
 echo "Done."

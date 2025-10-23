@@ -2,13 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Автовыгрузка задач активного спринта доски Яндекс.Трекера в Apple Reminders.
-Конфиг из ~/.tracker_reminders.env, запуск строгий: вторник 20:00 МСК.
+Автовыгрузка задач активного спринта Яндекс.Трекера в Apple Reminders.
+Ежедневное обновление утром: 09:00 MSK. Обновляет статус (statusType), Due и Remind Me.
 """
-import os, re, subprocess
-from datetime import datetime
+
+import os
+import re
+import subprocess
+import tempfile
+from datetime import datetime,timedelta
 from typing import Optional, Any
 from zoneinfo import ZoneInfo
+import pandas as pd
 from yandex_tracker_client import TrackerClient
 from yandex_tracker_client.exceptions import TrackerClientError
 
@@ -32,29 +37,33 @@ def load_env_file(path: str):
 
 load_env_file(ENV_PATH)
 
-CLOUD_ORG_ID  = os.getenv("CLOUD_ORG_ID") or ""
-YT_BOARD_ID   = os.getenv("YT_BOARD_ID") or ""
-YT_QUERY_XTRA = (os.getenv("YT_QUERY_XTRA") or "Status: !Closed").strip()
-YT_ASSIGNEE   = os.getenv("YT_ASSIGNEE")
+CLOUD_ORG_ID   = os.getenv("CLOUD_ORG_ID") or ""
+YT_BOARD_ID    = os.getenv("YT_BOARD_ID") or ""
+YT_QUERY_XTRA  = (os.getenv("YT_QUERY_XTRA") or "Status: !Closed").strip()
+YT_ASSIGNEE    = os.getenv("YT_ASSIGNEE")  # optional
 REM_LIST_PREFIX = os.getenv("REM_LIST_PREFIX", "").strip()
+
 if not CLOUD_ORG_ID or not YT_BOARD_ID.isdigit():
     raise SystemExit(f"Set CLOUD_ORG_ID and numeric YT_BOARD_ID in .env ({ENV_PATH}) or env vars.")
+
 BOARD_ID_INT = int(YT_BOARD_ID)
 
 
-def guard_msk_20():
+# ---------- Time guard: 09:00 MSK daily ----------
+def guard_msk_morning():
     now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
-    if not (now_msk.hour == 20 and now_msk.minute == 0):
-        print("Guard:", now_msk.strftime("%Y-%m-%d %H:%M %Z"), "— not 20:00 MSK; skip.")
+    if not (now_msk.hour == 9 and now_msk.minute == 0):
+        print("Guard:", now_msk.strftime("%Y-%m-%d %H:%M %Z"), "— not 09:00 MSK; skip.")
         raise SystemExit(0)
 
 
+# ---------- Token ----------
 def _get_iam_token() -> str:
     tok = os.getenv("IAM_TOKEN")
     if tok:
         return tok.strip()
     try:
-        out = subprocess.run(["yc","iam","create-token"], check=True, capture_output=True, text=True).stdout.strip()
+        out = subprocess.run(["yc", "iam", "create-token"], check=True, capture_output=True, text=True).stdout.strip()
         if not out:
             raise RuntimeError("empty token from yc")
         return out
@@ -62,6 +71,7 @@ def _get_iam_token() -> str:
         raise SystemExit(f"Unable to obtain IAM token. Set IAM_TOKEN or install/configure yc. Detail: {e}")
 
 
+# ---------- Helpers ----------
 def _quote(s: str) -> str:
     return '"' + s.replace('"','\\"').replace("\\","\\\\").replace("\n"," ").replace("\r"," ") + '"'
 
@@ -73,7 +83,7 @@ def _assignee_clause(val: Optional[str]) -> Optional[str]:
     if not a:
         return None
     low = a.lower()
-    if low in {"unassigned","none","empty"}:
+    if low in {"unassigned", "none", "empty"}:
         return "Assignee: empty()"
     if a.endswith("()"):
         return f"Assignee: {a}"
@@ -93,14 +103,13 @@ def _assignee_clause(val: Optional[str]) -> Optional[str]:
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-
 def _extract_email(obj: Any) -> Optional[str]:
     if obj is None:
         return None
     if isinstance(obj, str):
         m = EMAIL_RE.search(obj)
         return m.group(0) if m else None
-    if isinstance(obj, (list,tuple)):
+    if isinstance(obj, (list, tuple)):
         for it in obj:
             em = _extract_email(it)
             if em:
@@ -119,8 +128,8 @@ def _extract_email(obj: Any) -> Optional[str]:
         return None
     try:
         for k in ("email","display","login","self","name"):
-            if hasattr(obj,k):
-                em = _extract_email(getattr(obj,k))
+            if hasattr(obj, k):
+                em = _extract_email(getattr(obj, k))
                 if em:
                     return em
     except Exception:
@@ -131,32 +140,48 @@ def _extract_email(obj: Any) -> Optional[str]:
         return None
 
 
+def _issue_is_completed_by_status_type(status_type: dict | None) -> bool:
+    if not status_type or not isinstance(status_type, dict):
+        return False
+    key = (status_type.get("key") or "").lower()
+    finals = {"done", "closed", "resolved", "completed"}
+    return key in finals
+
+
+# ---------- Tracker ----------
 def build_client() -> TrackerClient:
     return TrackerClient(iam_token=_get_iam_token(), cloud_org_id=CLOUD_ORG_ID)
 
 
 def get_active_sprint_name_via_sdk(client: TrackerClient, board_id: int) -> Optional[str]:
-    board = client.boards[board_id]
-    sprints = list(board.sprints.get_all())
+    board = client.boards[board_id]      # объект доски
+    sprints = list(board.sprints.get_all())  # все спринты доски
+
     def status_key(s) -> str:
-        st = getattr(s,"status",None) or {}
-        if isinstance(st,dict):
-            return (st.get("key") or st.get("id") or "").lower()
-        return (getattr(s,"key","") or getattr(s,"id","")).lower()
-    active = [s for s in sprints if status_key(s) in {"inprogress","active","started"}]
+        st = getattr(s, "status", None) or {}
+        return st
+
+    active = [s for s in sprints if status_key(s) in {"in_progress"}]
     if not active:
         return None
+
     def sid(s):
         try:
-            return int(getattr(s,"id",0) or (s.get("id",0) if isinstance(s,dict) else 0))
+            return int(getattr(s, "id", 0) or (s.get("id", 0) if isinstance(s, dict) else 0))
         except Exception:
             return 0
     active.sort(key=sid, reverse=True)
-    name = getattr(active[0],"name",None) or (active[0].get("name") if isinstance(active[0],dict) else None)
-    return name
+    s = active[0]
+    name = getattr(s, "name", None) or (s.get("name") if isinstance(s, dict) else None)
+    end_raw = getattr(s, "endDate", None) or (s.get("endDate") if isinstance(s, dict) else None)
+
+    end_dt = None
+    if end_raw:
+        end_dt = str(pd.to_datetime(end_raw)+timedelta(hours=18))
+    return name, end_dt
 
 
-def active_sprint_query_by_board_id(board_id: int, extra: Optional[str]=None, assignee: Optional[str]=None) -> str:
+def active_sprint_query_by_board_id(board_id: int, extra: Optional[str] = None, assignee: Optional[str] = None) -> str:
     parts = [f'"Sprint In Progress By Board": {board_id}']
     a = _assignee_clause(assignee)
     if a:
@@ -170,25 +195,76 @@ def find_issues(client: TrackerClient, q: str):
     return client.issues.find(q, per_page=100)
 
 
-def add_to_reminders_if_absent(list_name: str, title: str, note: str, due_dt: tuple|None=None):
-    esc = lambda s: s.replace('"','\\"')
-    set_due = ""
+# ---------- Reminders ----------
+def add_to_reminders_if_absent(
+    list_name: str,
+    title: str,
+    note: str,
+    due_dt: tuple | None = None,
+    completed: bool | None = None,
+):
+    """Тело заметки читается из временного файла (UTF-8). Ставим due и remind me даты.
+    completed=True/False управляет галочкой завершения."""
+    # write note to file
+    safe_note = (note or "").replace("\r", "")
+    body_path = os.path.join(tempfile.gettempdir(), "tracker_reminder_body.txt")
+    with open(body_path, "w", encoding="utf-8") as f:
+        f.write(safe_note)
+
+    esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+
+    set_dates = ""
     if due_dt:
-        y,m,d,hh,mm = due_dt
-        MONTHS=["January","February","March","April","May","June","July","August","September","October","November","December"]
-        mon_name = MONTHS[m-1]
-        set_due = f"""
+        y, m, d, hh, mm = due_dt
+        set_dates = f"""
             set theDate to (current date)
             set year of theDate to {y}
-            set month of theDate to {mon_name}
+            set month of theDate to (item {m} of {{January, February, March, April, May, June, July, August, September, October, November, December}})
             set day of theDate to {d}
             set time of theDate to ({hh} * hours + {mm} * minutes)
-            set due date of theReminder to theDate
+            set seconds of theDate to 0
+            try
+                set due date of theReminder to theDate
+            end try
+            try
+                set allday due date of theReminder to missing value
+            end try
         """
-    script = f"""
+
+    set_completed = ""
+    if completed is True:
+        set_completed = """
+            try
+                set completed of theReminder to true
+            end try
+        """
+    elif completed is False:
+        set_completed = """
+            try
+                set completed of theReminder to false
+            end try
+        """
+    else:
+        set_completed = ""
+
+    script = f'''
     set theListName to "{esc(list_name)}"
     set theTitle to "{esc(title)}"
-    set theBody to "{esc(note)}"
+    set theBodyPath to POSIX file "{esc(body_path)}"
+
+    set theBody to ""
+    set fileRef to open for access theBodyPath
+    try
+        set theBody to (read fileRef as «class utf8»)
+    on error
+        try
+            set theBody to (read fileRef)
+        end try
+    end try
+    try
+        close access fileRef
+    end try
+
     tell application "Reminders"
         if not (exists list theListName) then
             make new list with properties {{name:theListName}}
@@ -203,90 +279,93 @@ def add_to_reminders_if_absent(list_name: str, title: str, note: str, due_dt: tu
                     exit repeat
                 end if
             end repeat
+
             if nameExists is false then
                 set theReminder to make new reminder at end with properties {{name:theTitle, body:theBody}}
-                {set_due}
+                {set_dates}
+                {set_completed}
             else
                 set body of theReminder to theBody
-                {set_due}
+                {set_dates}
+                {set_completed}
             end if
         end tell
     end tell
-    """
-    subprocess.run(["/usr/bin/osascript","-e",script], check=True)
+    '''
+
+    subprocess.run(["/usr/bin/osascript", "-e", script], check=True)
 
 
 def _parse_deadline_components(issue) -> Optional[tuple]:
     dt_raw = None
-    for attr in ("deadline","dueDate"):
-        if hasattr(issue,attr):
-            dt_raw = getattr(issue,attr)
-            if dt_raw:
-                break
-        try:
-            dt_raw = issue.get(attr) if isinstance(issue,dict) else None
-            if dt_raw:
-                break
-        except Exception:
-            pass
+    attr = ("deadline")
+    if hasattr(issue, attr):
+        dt_raw = getattr(issue, attr)
     if not dt_raw:
         return None
-    s = str(dt_raw).strip()
-    for fmt in ("%Y-%m-%dT%H:%M:%S","%Y-%m-%dT%H:%M","%Y-%m-%d"):
-        try:
-            from datetime import datetime as _dt
-            dt = _dt.strptime(s[:len(fmt)], fmt)
-            if fmt == "%Y-%m-%d":
-                dt = dt.replace(hour=9, minute=0)
-            return (dt.year, dt.month, dt.day, dt.hour, dt.minute)
-        except ValueError:
-            continue
-    return None
+    else: dt  = pd.to_datetime(dt_raw)+timedelta(hours=18)
+    return (dt.year, dt.month, dt.day, dt.hour, dt.minute)
+
 
 
 def _get_description(issue) -> str:
     desc = ""
     for attr in ("description",):
-        if hasattr(issue,attr):
-            desc = getattr(issue,attr) or ""
+        if hasattr(issue, attr):
+            desc = getattr(issue, attr) or ""
             break
         try:
-            desc = issue.get(attr,"")
+            desc = issue.get(attr, "")
             if desc:
                 break
         except Exception:
             pass
-    desc = str(desc).strip().replace("\r"," ")
+    desc = str(desc).strip().replace("\r", " ")
     return (desc[:2000] + "…") if len(desc) > 2000 else desc
 
 
 def main():
-    guard_msk_20()
     client = build_client()
-    sprint_name = get_active_sprint_name_via_sdk(client, BOARD_ID_INT)
+
+    sprint_name,sprint_end_dt = get_active_sprint_name_via_sdk(client, BOARD_ID_INT)
     if not sprint_name:
         print("No active sprint by status on the board — nothing to sync.")
         return
     reminders_list = f"{REM_LIST_PREFIX}{sprint_name}" if REM_LIST_PREFIX else sprint_name
+
     q = active_sprint_query_by_board_id(BOARD_ID_INT, YT_QUERY_XTRA, YT_ASSIGNEE)
+
     try:
         issues = list(find_issues(client, q))
     except TrackerClientError as e:
         raise SystemExit(f"Tracker query failed: {e}")
+
     if not issues:
         print("Active sprint has no issues for applied filter — done.")
         return
+
     added = 0
+    def _to_tuple(dt: str) -> tuple:
+        dt = pd.to_datetime(dt)
+        return (dt.year, dt.month, dt.day, dt.hour, dt.minute)
     for it in issues:
-        key = getattr(it,"key","")
-        title = f"[{key}] {getattr(it,'summary','')}"
+        key = getattr(it, "key", "")
+        title = f"[{key}] {getattr(it, 'summary', '')}"
         url = f"https://tracker.yandex.ru/{key}" if key else ""
-        assignee_email = _extract_email(getattr(it,"assignee",None)) or "—"
-        author_email   = _extract_email(getattr(it,"createdBy",None)) or "—"
-        status = getattr(it,"status",None)
-        status_disp = status.get("display") if isinstance(status,dict) else ""
+
+        assignee_email = _extract_email(getattr(it, "assignee", None)) or "—"
+        author_email   = _extract_email(getattr(it, "createdBy", None)) or "—"
+
+        # statusType is the source of truth
+        status_type = getattr(it, "statusType", None)
+        status_disp = status_type.get("display", "") if isinstance(status_type, dict) else ""
+        is_done = _issue_is_completed_by_status_type(status_type)
+
         description = _get_description(it)
         deadline_components = _parse_deadline_components(it)
+        if not deadline_components and sprint_end_dt:
+            deadline_components = _to_tuple(sprint_end_dt)
+
         note_parts = [
             f"Статус: {status_disp}",
             f"Автор: {author_email}",
@@ -294,13 +373,21 @@ def main():
             f"Ссылка: {url}",
         ]
         if description:
-            note_parts.append("")
-            note_parts.append("Описание:")
-            note_parts.append(description)
+            note_parts += ["", "Описание:", description]
+
         note = "\n".join(note_parts)
-        add_to_reminders_if_absent(reminders_list, title, note, due_dt=deadline_components)
+
+        add_to_reminders_if_absent(
+            reminders_list,
+            title,
+            note,
+            due_dt=deadline_components,
+            completed=is_done,
+        )
         added += 1
+
     print(f"Processed {added} issues into Reminders list '{reminders_list}'")
+
 
 
 if __name__ == "__main__":
